@@ -25,6 +25,8 @@ public protocol YOLOViewDelegate: AnyObject {
 
 }
 
+private let defaultMaxDetectionItems = 100
+
 /// A UIView component that provides real-time object detection, segmentation, and pose estimation capabilities.
 @MainActor
 public final class YOLOView: UIView, VideoCaptureDelegate {
@@ -102,8 +104,15 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
   public var pauseButton = UIButton()
   public var switchCameraButton = UIButton()
   public var shareButton = UIButton()
+  public var infoButton = UIButton()
   public var toolbar = UIView()
   let selection = UISelectionFeedbackGenerator()
+  private let lensControl = UISegmentedControl()
+  private let lensCaptionLabel = UILabel()
+  private var cameraTransitionView: UIView?
+  private var lensDevices = [AVCaptureDevice]()
+  private var selectedLensDeviceID: String?
+  private var cameraSwitchInProgress = false
   private var overlayLayer = CALayer()
   private var maskLayer: CALayer?
   private var poseLayer: CALayer?
@@ -208,6 +217,7 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
         switch result {
         case .success(let predictor):
           self.videoCapture.predictor = predictor
+          predictor.setNumItemsThreshold(numItems: self.getNumItemsThreshold())
           self.labelName.text = processString(self.modelName)
           if task == .obb { self.obbLayer?.isHidden = false }
           completion?(.success(()))
@@ -245,6 +255,12 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
               self.pendingCameraPosition = nil
               self.switchCameraTapped()
             }
+            if let device = self.videoCapture.captureDevice {
+              self.lastZoomFactor = device.videoZoomFactor
+              self.labelZoom.text = self.zoomLabelText(
+                rawZoomFactor: self.lastZoomFactor, device: device)
+            }
+            self.updateLensControl()
 
             self.busy = false
           }
@@ -264,7 +280,7 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
   // MARK: - Threshold Configuration Methods
 
   /// Sets the maximum number of detection items to include in results.
-  /// - Parameter numItems: The maximum number of items to include (default is 30).
+  /// - Parameter numItems: The maximum number of items to include (default is 100).
   public func setNumItemsThreshold(_ numItems: Int) {
     sliderNumItems.value = Float(numItems)
     (videoCapture.predictor as? BasePredictor)?.setNumItemsThreshold(numItems: numItems)
@@ -432,11 +448,7 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
   func showBoxes(predictions: YOLOResult) {
     let width = self.bounds.width
     let height = self.bounds.height
-    let resultCount = predictions.boxes.count
-    let maxVisible = min(resultCount, 50, boundingBoxViews.count)
-
-    self.labelSliderNumItems.text =
-      "\(resultCount) items (max \(Int(sliderNumItems.value)))"
+    let maxVisible = min(predictions.boxes.count, 50, boundingBoxViews.count)
 
     if UIDevice.current.orientation.isLandscape {
       let frameAspect = videoCapture.longSide / videoCapture.shortSide
@@ -600,14 +612,9 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     labelFPS.font = UIFont.preferredFont(forTextStyle: .body)
     self.addSubview(labelFPS)
 
-    labelSliderNumItems.text = "0 items (max 30)"
-    labelSliderNumItems.textAlignment = .left
-    labelSliderNumItems.textColor = .white
-    labelSliderNumItems.font = UIFont.preferredFont(forTextStyle: .subheadline)
-    self.addSubview(labelSliderNumItems)
-
-    configureSlider(sliderNumItems, min: 1, max: 100, value: 30)
-    self.addSubview(sliderNumItems)
+    labelSliderNumItems.isHidden = true
+    configureSlider(sliderNumItems, min: 1, max: 100, value: Float(defaultMaxDetectionItems))
+    sliderNumItems.isHidden = true
 
     labelSliderConf.text = "0.25 Confidence Threshold"
     labelSliderConf.textAlignment = .left
@@ -627,15 +634,13 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     configureSlider(sliderIoU, min: 0, max: 1, value: 0.7)
     self.addSubview(sliderIoU)
 
-    self.labelSliderNumItems.text = "0 items (max " + String(Int(sliderNumItems.value)) + ")"
     self.labelSliderConf.text = "0.25 Confidence Threshold"
     self.labelSliderIoU.text = "0.70 IoU Threshold"
 
     labelZoom.text = "1.00x"
     labelZoom.textColor = .white
-    labelZoom.font = UIFont.systemFont(ofSize: 14)
+    labelZoom.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
     labelZoom.textAlignment = .center
-    labelZoom.font = UIFont.preferredFont(forTextStyle: .body)
     self.addSubview(labelZoom)
 
     let config = UIImage.SymbolConfiguration(pointSize: 20, weight: .regular, scale: .default)
@@ -647,14 +652,17 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
       UIImage(systemName: "camera.rotate", withConfiguration: config), for: .normal)
     shareButton.setImage(
       UIImage(systemName: "square.and.arrow.up", withConfiguration: config), for: .normal)
-
+    infoButton.setImage(UIImage(systemName: "info.circle", withConfiguration: config), for: .normal)
+    infoButton.accessibilityLabel = "Ultralytics"
     playButton.isEnabled = false
     pauseButton.isEnabled = true
     playButton.addTarget(self, action: #selector(playTapped), for: .touchUpInside)
     pauseButton.addTarget(self, action: #selector(pauseTapped), for: .touchUpInside)
     switchCameraButton.addTarget(self, action: #selector(switchCameraTapped), for: .touchUpInside)
+    infoButton.addTarget(self, action: #selector(infoTapped), for: .touchUpInside)
 
     setupToolbar()
+    setupLensControl()
 
     self.addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinch)))
   }
@@ -672,11 +680,35 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
   /// Setup toolbar with consistent styling
   private func setupToolbar() {
     toolbar.backgroundColor = .black.withAlphaComponent(0.7)
-    [playButton, pauseButton, switchCameraButton, shareButton].forEach { button in
+    [playButton, pauseButton, switchCameraButton, shareButton, infoButton].forEach { button in
       button.tintColor = .white
       toolbar.addSubview(button)
     }
     self.addSubview(toolbar)
+  }
+
+  private func setupLensControl() {
+    lensControl.isHidden = true
+    lensControl.backgroundColor = UIColor.black.withAlphaComponent(0.38)
+    lensControl.selectedSegmentTintColor = UIColor.white.withAlphaComponent(0.18)
+    lensControl.setTitleTextAttributes(
+      [
+        .foregroundColor: UIColor.white,
+        .font: UIFont.systemFont(ofSize: 13, weight: .semibold),
+      ], for: .normal)
+    lensControl.setTitleTextAttributes(
+      [
+        .foregroundColor: UIColor.systemYellow,
+        .font: UIFont.systemFont(ofSize: 13, weight: .bold),
+      ], for: .selected)
+    lensControl.addTarget(self, action: #selector(lensChanged(_:)), for: .valueChanged)
+    self.addSubview(lensControl)
+
+    lensCaptionLabel.isHidden = true
+    lensCaptionLabel.textAlignment = .center
+    lensCaptionLabel.textColor = UIColor.white.withAlphaComponent(0.78)
+    lensCaptionLabel.font = UIFont.systemFont(ofSize: 11, weight: .medium)
+    self.addSubview(lensCaptionLabel)
   }
 
   public override func layoutSubviews() {
@@ -687,6 +719,7 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
 
     // Apply consistent toolbar styling
     applyToolbarStyling(isLandscape: isLandscape)
+    updateLensControlVisibility()
 
     if isLandscape {
       layoutLandscape()
@@ -695,13 +728,14 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     }
 
     self.videoCapture.previewLayer?.frame = self.bounds
+    cameraTransitionView?.frame = self.bounds
   }
 
   /// Apply consistent toolbar and button styling
   private func applyToolbarStyling(isLandscape: Bool) {
     toolbar.backgroundColor = .black.withAlphaComponent(0.7)
     let buttonColor: UIColor = isLandscape ? .white : .white
-    [playButton, pauseButton, switchCameraButton, shareButton].forEach { button in
+    [playButton, pauseButton, switchCameraButton, shareButton, infoButton].forEach { button in
       button.tintColor = buttonColor
     }
   }
@@ -724,22 +758,14 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     let sliderWidth: CGFloat = width * 0.2
     let sliderHeight: CGFloat = height * 0.06
 
-    let bottomMargin: CGFloat = 80
+    let bottomMargin: CGFloat = lensControl.isHidden ? 80 : 144
     let totalSliderHeight = (sliderHeight + 3) * 6
     let startY = height - bottomMargin - totalSliderHeight
 
-    labelSliderNumItems.frame = CGRect(
-      x: width * 0.1, y: startY,
-      width: sliderWidth, height: sliderHeight
-    )
-
-    sliderNumItems.frame = CGRect(
-      x: width * 0.1, y: labelSliderNumItems.frame.maxY + 3,
-      width: sliderWidth, height: sliderHeight
-    )
+    let thresholdStartY = startY + (sliderHeight + 3) * 2 + 10
 
     labelSliderConf.frame = CGRect(
-      x: width * 0.1, y: sliderNumItems.frame.maxY + 3,
+      x: width * 0.1, y: thresholdStartY,
       width: sliderWidth * 1.5, height: sliderHeight
     )
 
@@ -765,6 +791,7 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     )
 
     layoutToolbarButtons(width: width, height: height)
+    layoutLensControl(width: width, height: height)
   }
 
   /// Layout views for portrait orientation
@@ -786,18 +813,12 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     let sliderHeight: CGFloat = height * 0.02
     let leftPadding: CGFloat = 20
 
-    labelSliderNumItems.frame = CGRect(
-      x: leftPadding, y: center.y + height * 0.16,
-      width: sliderWidth, height: sliderHeight
-    )
-
-    sliderNumItems.frame = CGRect(
-      x: leftPadding, y: labelSliderNumItems.frame.maxY + 10,
-      width: sliderWidth, height: sliderHeight
-    )
+    let cameraControlsOffset: CGFloat = lensControl.isHidden ? 0 : 64
+    let thresholdStartY =
+      center.y + height * 0.16 + sliderHeight * 2 + 40 - cameraControlsOffset
 
     labelSliderConf.frame = CGRect(
-      x: leftPadding, y: sliderNumItems.frame.maxY + 10,
+      x: leftPadding, y: thresholdStartY,
       width: sliderWidth * 1.5, height: sliderHeight
     )
 
@@ -823,6 +844,7 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     )
 
     layoutToolbarButtons(width: width, height: height)
+    layoutLensControl(width: width, height: height)
   }
 
   /// Layout toolbar buttons (shared between orientations)
@@ -841,6 +863,36 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     shareButton.frame = CGRect(
       x: switchCameraButton.frame.maxX, y: 0, width: buttonHeight, height: buttonHeight
     )
+    infoButton.frame = CGRect(
+      x: width - buttonHeight, y: 0, width: buttonHeight, height: buttonHeight
+    )
+  }
+
+  private func layoutLensControl(width: CGFloat, height: CGFloat) {
+    guard !lensControl.isHidden else { return }
+    let toolBarHeight: CGFloat = 66
+    let controlHeight: CGFloat = 34
+    let captionHeight: CGFloat = 14
+    let zoomHeight: CGFloat = 18
+    let controlWidth = min(CGFloat(lensDevices.count) * 60, width - 40)
+    lensControl.frame = CGRect(
+      x: (width - controlWidth) / 2,
+      y: height - toolBarHeight - controlHeight - 14,
+      width: controlWidth,
+      height: controlHeight
+    )
+    lensCaptionLabel.frame = CGRect(
+      x: 20,
+      y: lensControl.frame.minY - captionHeight - 4,
+      width: width - 40,
+      height: captionHeight
+    )
+    labelZoom.frame = CGRect(
+      x: center.x - 50,
+      y: lensCaptionLabel.frame.minY - zoomHeight - 2,
+      width: 100,
+      height: zoomHeight
+    )
   }
 
   private func setUpOrientationChangeNotification() {
@@ -850,9 +902,22 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
   }
 
   @objc func orientationDidChange() {
-    guard let orientation = AVCaptureVideoOrientation(UIDevice.current.orientation) else { return }
-    videoCapture.updateVideoOrientation(orientation: orientation)
+    videoCapture.updateVideoOrientation(orientation: currentVideoOrientation())
     videoCapture.frameSizeCaptured = false
+  }
+
+  private func currentVideoOrientation() -> AVCaptureVideoOrientation {
+    if let interfaceOrientation = window?.windowScene?.interfaceOrientation,
+      let videoOrientation = AVCaptureVideoOrientation(interfaceOrientation)
+    {
+      return videoOrientation
+    }
+
+    if let videoOrientation = AVCaptureVideoOrientation(UIDevice.current.orientation) {
+      return videoOrientation
+    }
+
+    return videoCapture.previewLayer?.connection?.videoOrientation ?? .portrait
   }
 
   @objc public func sliderChanged(_ sender: Any) {
@@ -862,7 +927,6 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     if slider === sliderNumItems {
       let numItems = Int(sliderNumItems.value)
       predictor?.setNumItemsThreshold(numItems: numItems)
-      updateNumItemsLabel(max: numItems)
     } else if slider === sliderConf {
       let conf = Double(round(100 * sliderConf.value)) / 100
       self.labelSliderConf.text = String(format: "%.2f Confidence Threshold", conf)
@@ -874,13 +938,6 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     }
   }
 
-  /// Rewrites the numItems label, keeping any existing "current count" prefix intact.
-  private func updateNumItemsLabel(max numItems: Int) {
-    let current = self.labelSliderNumItems.text ?? ""
-    let countPrefix = current.range(of: " items").map { String(current[..<$0.lowerBound]) } ?? "0"
-    self.labelSliderNumItems.text = "\(countPrefix) items (max \(numItems))"
-  }
-
   /// Update thresholds programmatically (for external display sync).
   public func updateThresholds(conf: Double, iou: Double, numItems: Int) {
     sliderConf.value = Float(conf)
@@ -888,7 +945,6 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     sliderNumItems.value = Float(numItems)
     self.labelSliderConf.text = String(format: "%.2f Confidence Threshold", conf)
     self.labelSliderIoU.text = String(format: "%.2f IoU Threshold", iou)
-    updateNumItemsLabel(max: numItems)
 
     if let predictor = videoCapture.predictor as? BasePredictor {
       predictor.setConfidenceThreshold(confidence: conf)
@@ -921,12 +977,14 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
     switch pinch.state {
     case .began, .changed:
       update(scale: newScaleFactor)
-      self.labelZoom.text = String(format: "%.2fx", newScaleFactor)
-      self.labelZoom.font = UIFont.preferredFont(forTextStyle: .title2)
+      self.labelZoom.text = zoomLabelText(rawZoomFactor: newScaleFactor, device: device)
+      updateSelectedLens(rawZoomFactor: newScaleFactor, device: device)
+      self.labelZoom.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
     case .ended:
       lastZoomFactor = minMaxZoom(newScaleFactor)
       update(scale: lastZoomFactor)
-      self.labelZoom.font = UIFont.preferredFont(forTextStyle: .body)
+      updateSelectedLens(rawZoomFactor: lastZoomFactor, device: device)
+      self.labelZoom.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
     default: break
     }
   }
@@ -948,35 +1006,227 @@ public final class YOLOView: UIView, VideoCaptureDelegate {
   @objc func switchCameraTapped() {
     selection.selectionChanged()
 
-    self.videoCapture.captureSession.beginConfiguration()
-    guard let currentInput = self.videoCapture.captureSession.inputs.first as? AVCaptureDeviceInput
-    else {
-      self.videoCapture.captureSession.commitConfiguration()
-      return
-    }
-    self.videoCapture.captureSession.removeInput(currentInput)
-    let currentPosition = currentInput.device.position
-
+    let currentPosition = videoCapture.captureDevice?.position ?? .back
     let nextCameraPosition: AVCaptureDevice.Position = currentPosition == .back ? .front : .back
+    guard let newCameraDevice = bestCaptureDevice(position: nextCameraPosition) else { return }
+    switchToCamera(newCameraDevice)
+  }
 
-    guard let newCameraDevice = bestCaptureDevice(position: nextCameraPosition) else {
-      self.videoCapture.captureSession.commitConfiguration()
+  @objc private func lensChanged(_ sender: UISegmentedControl) {
+    selection.selectionChanged()
+    guard sender.selectedSegmentIndex >= 0,
+      sender.selectedSegmentIndex < lensDevices.count
+    else {
+      return
+    }
+    switchToCamera(lensDevices[sender.selectedSegmentIndex])
+  }
+
+  @objc private func infoTapped() {
+    selection.selectionChanged()
+    if let url = URL(string: "https://www.ultralytics.com") {
+      UIApplication.shared.open(url)
+    }
+  }
+
+  private func switchToCamera(_ device: AVCaptureDevice) {
+    guard !cameraSwitchInProgress else { return }
+    let changesPosition = videoCapture.captureDevice?.position != device.position
+    cameraSwitchInProgress = true
+    setCameraControlsEnabled(false)
+    if changesPosition {
+      showCameraTransition()
+    }
+
+    videoCapture.selectCaptureDevice(device, videoOrientation: currentVideoOrientation()) {
+      [weak self] success in
+      guard let self else { return }
+
+      self.cameraSwitchInProgress = false
+      self.setCameraControlsEnabled(true)
+      if changesPosition {
+        self.hideCameraTransition()
+      }
+
+      guard success else {
+        self.updateLensControl()
+        return
+      }
+
+      self.selectedLensDeviceID = device.position == .back ? device.uniqueID : nil
+      let activeDevice = self.videoCapture.captureDevice ?? device
+      let rawZoomFactor =
+        zoomFactor(for: device, on: activeDevice)
+        ?? min(max(activeDevice.videoZoomFactor, self.minimumZoom), self.maximumZoom)
+      self.lastZoomFactor = rawZoomFactor
+      self.labelZoom.text = self.zoomLabelText(rawZoomFactor: rawZoomFactor, device: activeDevice)
+      self.updateLensControl()
+    }
+  }
+
+  private func showCameraTransition() {
+    cameraTransitionView?.removeFromSuperview()
+
+    let transitionView = UIView(frame: bounds)
+    transitionView.isUserInteractionEnabled = false
+    transitionView.backgroundColor = .black
+
+    if let snapshot = snapshotView(afterScreenUpdates: false) {
+      snapshot.frame = transitionView.bounds
+      transitionView.addSubview(snapshot)
+    }
+
+    let blurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+    blurView.frame = transitionView.bounds
+    blurView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    transitionView.addSubview(blurView)
+
+    insertSubview(transitionView, belowSubview: labelName)
+    cameraTransitionView = transitionView
+  }
+
+  private func hideCameraTransition() {
+    guard let transitionView = cameraTransitionView else { return }
+    cameraTransitionView = nil
+    UIView.animate(
+      withDuration: 0.18,
+      delay: 0.06,
+      options: [.beginFromCurrentState, .curveEaseOut]
+    ) {
+      transitionView.alpha = 0
+    } completion: { _ in
+      transitionView.removeFromSuperview()
+    }
+  }
+
+  private func setCameraControlsEnabled(_ isEnabled: Bool) {
+    switchCameraButton.isEnabled = isEnabled
+    lensControl.isEnabled = isEnabled
+    UIView.animate(withDuration: 0.12) {
+      self.switchCameraButton.alpha = isEnabled ? 1 : 0.45
+      self.lensControl.alpha = isEnabled ? 1 : 0.55
+    }
+  }
+
+  private func updateLensControl() {
+    let currentDevice = videoCapture.captureDevice
+    let position = currentDevice?.position ?? .back
+    lensDevices =
+      position == .front ? currentDevice.map { [$0] } ?? [] : captureDevices(position: position)
+    if let selectedLensDeviceID,
+      !lensDevices.contains(where: { $0.uniqueID == selectedLensDeviceID })
+    {
+      self.selectedLensDeviceID = nil
+    }
+    if position == .back, let currentDevice, selectedLensDeviceID == nil {
+      selectedLensDeviceID =
+        lensDevice(
+          rawZoomFactor: currentDevice.videoZoomFactor, device: currentDevice)?.uniqueID
+    }
+    lensControl.removeAllSegments()
+
+    for (index, device) in lensDevices.enumerated() {
+      lensControl.insertSegment(withTitle: lensTitle(for: device), at: index, animated: false)
+    }
+
+    let selectedDeviceID = selectedLensDeviceID ?? currentDevice?.uniqueID
+    lensControl.selectedSegmentIndex =
+      lensDevices.firstIndex { $0.uniqueID == selectedDeviceID }
+      ?? UISegmentedControl.noSegment
+    lensCaptionLabel.text = selectedLensDevice().map { lensCaption(for: $0) }
+    updateLensControlVisibility()
+    setNeedsLayout()
+  }
+
+  private func updateLensControlVisibility() {
+    lensControl.isHidden = switchCameraButton.isHidden || lensDevices.isEmpty
+    lensCaptionLabel.isHidden = lensControl.isHidden
+  }
+
+  private func lensTitle(for device: AVCaptureDevice) -> String {
+    if device.position == .front {
+      return "1"
+    }
+
+    switch device.deviceType {
+    case .builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera:
+      if let displayZoomFactor = displayZoomFactor(
+        for: device, activeDevice: videoCapture.captureDevice)
+      {
+        return zoomTitle(displayZoomFactor)
+      }
+      return fallbackLensTitle(for: device)
+    default: return device.localizedName
+    }
+  }
+
+  private func fallbackLensTitle(for device: AVCaptureDevice) -> String {
+    switch device.deviceType {
+    case .builtInUltraWideCamera: return "0.5"
+    case .builtInWideAngleCamera: return "1"
+    case .builtInTelephotoCamera: return "2"
+    default: return device.localizedName
+    }
+  }
+
+  private func zoomTitle(_ zoomFactor: CGFloat) -> String {
+    let roundedZoom = (zoomFactor * 10).rounded() / 10
+    return roundedZoom.truncatingRemainder(dividingBy: 1) == 0
+      ? String(format: "%.0f", roundedZoom)
+      : String(format: "%.1f", roundedZoom)
+  }
+
+  private func zoomLabelText(rawZoomFactor: CGFloat, device: AVCaptureDevice) -> String {
+    String(format: "%.2fx", displayZoomFactor(rawZoomFactor, for: device))
+  }
+
+  private func selectedLensDevice() -> AVCaptureDevice? {
+    guard let selectedLensDeviceID else { return videoCapture.captureDevice }
+    return lensDevices.first { $0.uniqueID == selectedLensDeviceID } ?? videoCapture.captureDevice
+  }
+
+  private func updateSelectedLens(rawZoomFactor: CGFloat, device: AVCaptureDevice) {
+    guard device.position == .back else {
+      selectedLensDeviceID = nil
       return
     }
 
-    guard let videoInput1 = try? AVCaptureDeviceInput(device: newCameraDevice) else {
-      self.videoCapture.captureSession.commitConfiguration()
+    guard let selectedLens = lensDevice(rawZoomFactor: rawZoomFactor, device: device) else {
       return
     }
 
-    self.videoCapture.captureSession.addInput(videoInput1)
-    guard let orientation = AVCaptureVideoOrientation(UIDevice.current.orientation) else {
-      self.videoCapture.captureSession.commitConfiguration()
-      return
-    }
-    self.videoCapture.updateVideoOrientation(orientation: orientation)
+    selectedLensDeviceID = selectedLens.uniqueID
+    lensControl.selectedSegmentIndex =
+      lensDevices.firstIndex { $0.uniqueID == selectedLens.uniqueID }
+      ?? UISegmentedControl.noSegment
+    lensCaptionLabel.text = lensCaption(for: selectedLens)
+  }
 
-    self.videoCapture.captureSession.commitConfiguration()
+  private func lensDevice(rawZoomFactor: CGFloat, device: AVCaptureDevice) -> AVCaptureDevice? {
+    let lensZooms = lensDevices.compactMap { lens -> (device: AVCaptureDevice, zoom: CGFloat)? in
+      guard lens.position == .back, physicalLensTypes.contains(lens.deviceType),
+        let zoom = zoomFactor(for: lens, on: device)
+      else {
+        return nil
+      }
+      return (lens, zoom)
+    }.sorted { $0.zoom < $1.zoom }
+
+    return lensZooms.last(where: { rawZoomFactor >= $0.zoom - 0.01 })?.device
+      ?? lensZooms.first?.device
+  }
+
+  private func lensCaption(for device: AVCaptureDevice) -> String {
+    if device.position == .front {
+      return "Front camera"
+    }
+
+    switch device.deviceType {
+    case .builtInUltraWideCamera: return "Ultra wide camera"
+    case .builtInWideAngleCamera: return "Wide camera"
+    case .builtInTelephotoCamera: return "Telephoto camera"
+    default: return device.localizedName
+    }
   }
 
   public func capturePhoto(completion: @escaping (UIImage?) -> Void) {

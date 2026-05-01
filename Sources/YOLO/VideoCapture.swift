@@ -16,6 +16,12 @@ import CoreVideo
 import UIKit
 import Vision
 
+let physicalLensTypes: [AVCaptureDevice.DeviceType] = [
+  .builtInUltraWideCamera,
+  .builtInWideAngleCamera,
+  .builtInTelephotoCamera,
+]
+
 /// Protocol for receiving video capture frame processing results.
 @MainActor
 public protocol VideoCaptureDelegate: AnyObject {
@@ -23,25 +29,101 @@ public protocol VideoCaptureDelegate: AnyObject {
   func onInferenceTime(speed: Double, fps: Double)
 }
 
+func captureDevices(position: AVCaptureDevice.Position) -> [AVCaptureDevice] {
+  if position == .front {
+    return bestCaptureDevice(position: position).map { [$0] } ?? []
+  }
+
+  let discoverySession = AVCaptureDevice.DiscoverySession(
+    deviceTypes: physicalLensTypes,
+    mediaType: .video,
+    position: position
+  )
+
+  return discoverySession.devices
+    .sorted { $0.deviceType.lensSortOrder < $1.deviceType.lensSortOrder }
+}
+
 func bestCaptureDevice(position: AVCaptureDevice.Position) -> AVCaptureDevice? {
-  if UserDefaults.standard.bool(forKey: "use_telephoto"),
-    let device = AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: position)
-  {
-    return device
-  } else if let device = AVCaptureDevice.default(
-    .builtInDualCamera, for: .video, position: position)
-  {
-    return device
-  } else if let device = AVCaptureDevice.default(
-    .builtInWideAngleCamera, for: .video, position: position)
-  {
-    return device
-  } else {
-    return AVCaptureDevice.default(for: .video)
+  let preferredTypes: [AVCaptureDevice.DeviceType] =
+    position == .back
+    ? [.builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera, .builtInWideAngleCamera]
+    : [.builtInTrueDepthCamera, .builtInWideAngleCamera]
+
+  for deviceType in preferredTypes {
+    if let device = AVCaptureDevice.default(deviceType, for: .video, position: position) {
+      return device
+    }
+  }
+
+  return nil
+}
+
+func zoomFactor(for lensDevice: AVCaptureDevice, on virtualDevice: AVCaptureDevice) -> CGFloat? {
+  guard lensDevice.position == virtualDevice.position else { return nil }
+  let constituentDevices = virtualDevice.constituentDevices
+  guard constituentDevices.count > 1 else { return nil }
+
+  let lensIndex =
+    constituentDevices.firstIndex { $0.uniqueID == lensDevice.uniqueID }
+    ?? constituentDevices.firstIndex { $0.deviceType == lensDevice.deviceType }
+  guard let lensIndex else { return nil }
+
+  let switchOverZoomFactors = virtualDevice.virtualDeviceSwitchOverVideoZoomFactors.map {
+    CGFloat(truncating: $0)
+  }
+  let zoomFactors = [virtualDevice.minAvailableVideoZoomFactor] + switchOverZoomFactors
+  guard lensIndex < zoomFactors.count else { return nil }
+
+  return min(
+    max(zoomFactors[lensIndex], virtualDevice.minAvailableVideoZoomFactor),
+    virtualDevice.maxAvailableVideoZoomFactor
+  )
+}
+
+func displayZoomFactor(_ zoomFactor: CGFloat, for device: AVCaptureDevice) -> CGFloat {
+  if #available(iOS 18.0, *) {
+    return zoomFactor * device.displayVideoZoomFactorMultiplier
+  }
+  return zoomFactor
+}
+
+func displayZoomFactor(
+  for lensDevice: AVCaptureDevice, activeDevice: AVCaptureDevice?
+) -> CGFloat? {
+  let candidates = [activeDevice, bestCaptureDevice(position: lensDevice.position)].compactMap {
+    $0
+  }
+  for candidate in candidates {
+    if let zoomFactor = zoomFactor(for: lensDevice, on: candidate) {
+      return displayZoomFactor(zoomFactor, for: candidate)
+    }
+  }
+  return nil
+}
+
+extension AVCaptureDevice.DeviceType {
+  fileprivate var lensSortOrder: Int {
+    switch self {
+    case .builtInUltraWideCamera: return 0
+    case .builtInWideAngleCamera: return 1
+    case .builtInTelephotoCamera: return 2
+    default: return 3
+    }
   }
 }
 
 extension AVCaptureVideoOrientation {
+  init?(_ interfaceOrientation: UIInterfaceOrientation) {
+    switch interfaceOrientation {
+    case .portrait: self = .portrait
+    case .portraitUpsideDown: self = .portraitUpsideDown
+    case .landscapeLeft: self = .landscapeLeft
+    case .landscapeRight: self = .landscapeRight
+    default: return nil
+    }
+  }
+
   /// Maps a `UIDeviceOrientation` to the matching video orientation. Unknown device
   /// orientations (face-up/down) return `nil` so callers can preserve the existing setting.
   init?(_ deviceOrientation: UIDeviceOrientation) {
@@ -104,6 +186,9 @@ public final class VideoCapture: NSObject, @unchecked Sendable {
     orientation: UIDeviceOrientation
   ) -> Bool {
     captureSession.beginConfiguration()
+    defer {
+      captureSession.commitConfiguration()
+    }
     captureSession.sessionPreset = sessionPreset
 
     guard let device = bestCaptureDevice(position: position) else {
@@ -128,6 +213,7 @@ public final class VideoCapture: NSObject, @unchecked Sendable {
     let previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
     previewLayer.videoGravity = AVLayerVideoGravity.resizeAspectFill
     previewLayer.connection?.videoOrientation = videoOrientation
+    configureVideoMirroring(previewLayer.connection, isMirrored: position == .front)
     self.previewLayer = previewLayer
 
     let settings: [String: Any] = [
@@ -142,59 +228,147 @@ public final class VideoCapture: NSObject, @unchecked Sendable {
     }
     if captureSession.canAddOutput(photoOutput) {
       captureSession.addOutput(photoOutput)
-      if #available(iOS 16.0, *) {
-        // Use maxPhotoDimensions instead of deprecated isHighResolutionCaptureEnabled
-        if let device = captureDevice,
-          let maxDimensions = device.activeFormat.supportedMaxPhotoDimensions.last
-        {
-          photoOutput.maxPhotoDimensions = maxDimensions
-        }
-      } else {
-        // Fallback for iOS versions before 16.0
-        photoOutput.isHighResolutionCaptureEnabled = true
-      }
+      configurePhotoOutput(for: device)
     }
 
     // We want the buffers to be in portrait orientation otherwise they are
     // rotated by 90 degrees. Need to set this _after_ addOutput()!
     let connection = videoOutput.connection(with: AVMediaType.video)
     connection?.videoOrientation = videoOrientation
-    if position == .front {
-      connection?.isVideoMirrored = true
-    }
+    configureVideoMirroring(connection, isMirrored: position == .front)
 
-    guard let device = captureDevice else { return false }
-    do {
-      try device.lockForConfiguration()
-      if device.isFocusModeSupported(.continuousAutoFocus),
-        device.isFocusPointOfInterestSupported
-      {
-        device.focusMode = .continuousAutoFocus
-        device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
-      }
-      device.exposureMode = .continuousAutoExposure
-      device.unlockForConfiguration()
-    } catch {
+    guard configureCameraDevice(device) else {
       return false
     }
 
-    captureSession.commitConfiguration()
     return true
   }
 
-  func start() {
-    if !captureSession.isRunning {
-      DispatchQueue.global().async { [weak self] in
-        self?.captureSession.startRunning()
+  func selectCaptureDevice(
+    _ device: AVCaptureDevice,
+    videoOrientation: AVCaptureVideoOrientation,
+    completion: @escaping (Bool) -> Void
+  ) {
+    cameraQueue.async { [weak self] in
+      guard let self else {
+        DispatchQueue.main.async { completion(false) }
+        return
       }
+
+      let success = self.selectCaptureDeviceSync(device, videoOrientation: videoOrientation)
+      DispatchQueue.main.async {
+        completion(success)
+      }
+    }
+  }
+
+  private func selectCaptureDeviceSync(
+    _ device: AVCaptureDevice, videoOrientation: AVCaptureVideoOrientation
+  ) -> Bool {
+    if device.position == .back,
+      selectVirtualRearLens(device, videoOrientation: videoOrientation)
+    {
+      return true
+    }
+
+    guard captureDevice?.uniqueID != device.uniqueID else { return true }
+
+    return switchCaptureInput(to: device, videoOrientation: videoOrientation)
+  }
+
+  private func selectVirtualRearLens(
+    _ lensDevice: AVCaptureDevice, videoOrientation: AVCaptureVideoOrientation
+  ) -> Bool {
+    let candidates = [captureDevice, bestCaptureDevice(position: .back)].compactMap { $0 }
+    for virtualDevice in candidates {
+      guard let zoomFactor = zoomFactor(for: lensDevice, on: virtualDevice) else { continue }
+      if captureDevice?.uniqueID != virtualDevice.uniqueID,
+        !switchCaptureInput(to: virtualDevice, videoOrientation: videoOrientation)
+      {
+        return false
+      }
+      return rampZoom(to: zoomFactor, on: virtualDevice)
+    }
+    return false
+  }
+
+  private func switchCaptureInput(
+    to device: AVCaptureDevice, videoOrientation: AVCaptureVideoOrientation
+  ) -> Bool {
+    let newInput: AVCaptureDeviceInput
+    do {
+      newInput = try AVCaptureDeviceInput(device: device)
+    } catch {
+      YOLOLog.error("Failed to create video input: \(error)")
+      return false
+    }
+
+    guard configureCameraDevice(device) else {
+      return false
+    }
+
+    captureSession.beginConfiguration()
+    defer {
+      captureSession.commitConfiguration()
+    }
+
+    let currentInput = videoInput ?? captureSession.inputs.first as? AVCaptureDeviceInput
+    if let currentInput {
+      captureSession.removeInput(currentInput)
+    }
+
+    guard captureSession.canAddInput(newInput) else {
+      if let currentInput, captureSession.canAddInput(currentInput) {
+        captureSession.addInput(currentInput)
+      }
+      return false
+    }
+
+    captureSession.addInput(newInput)
+    videoInput = newInput
+    captureDevice = device
+    configurePhotoOutput(for: device)
+
+    let videoConnection = videoOutput.connection(with: .video)
+    videoConnection?.videoOrientation = videoOrientation
+    configureVideoMirroring(videoConnection, isMirrored: device.position == .front)
+    previewLayer?.connection?.videoOrientation = videoOrientation
+    configureVideoMirroring(previewLayer?.connection, isMirrored: device.position == .front)
+
+    return true
+  }
+
+  private func rampZoom(to zoomFactor: CGFloat, on device: AVCaptureDevice) -> Bool {
+    do {
+      try device.lockForConfiguration()
+      defer { device.unlockForConfiguration() }
+
+      let clampedZoomFactor = min(
+        max(zoomFactor, device.minAvailableVideoZoomFactor),
+        device.maxAvailableVideoZoomFactor
+      )
+      if device.isRampingVideoZoom {
+        device.cancelVideoZoomRamp()
+      }
+      device.ramp(toVideoZoomFactor: clampedZoomFactor, withRate: 20)
+      return true
+    } catch {
+      YOLOLog.error("Zoom configuration failed: \(error.localizedDescription)")
+      return false
+    }
+  }
+
+  func start() {
+    cameraQueue.async { [weak self] in
+      guard let self, !self.captureSession.isRunning else { return }
+      self.captureSession.startRunning()
     }
   }
 
   func stop() {
-    if captureSession.isRunning {
-      DispatchQueue.global().async { [weak self] in
-        self?.captureSession.stopRunning()
-      }
+    cameraQueue.async { [weak self] in
+      guard let self, self.captureSession.isRunning else { return }
+      self.captureSession.stopRunning()
     }
   }
 
@@ -218,16 +392,59 @@ public final class VideoCapture: NSObject, @unchecked Sendable {
   }
 
   func updateVideoOrientation(orientation: AVCaptureVideoOrientation) {
-    guard let connection = videoOutput.connection(with: .video) else { return }
+    cameraQueue.async { [weak self] in
+      guard let self, let connection = self.videoOutput.connection(with: .video) else { return }
 
-    connection.videoOrientation = orientation
-    let currentInput = self.captureSession.inputs.first as? AVCaptureDeviceInput
-    if currentInput?.device.position == .front {
-      connection.isVideoMirrored = true
-    } else {
-      connection.isVideoMirrored = false
+      connection.videoOrientation = orientation
+      let currentInput = self.captureSession.inputs.first as? AVCaptureDeviceInput
+      self.configureVideoMirroring(connection, isMirrored: currentInput?.device.position == .front)
+      self.previewLayer?.connection?.videoOrientation = connection.videoOrientation
+      self.configureVideoMirroring(
+        self.previewLayer?.connection, isMirrored: connection.isVideoMirrored)
     }
-    self.previewLayer?.connection?.videoOrientation = connection.videoOrientation
+  }
+
+  private func configureVideoMirroring(_ connection: AVCaptureConnection?, isMirrored: Bool) {
+    guard let connection else { return }
+    guard connection.isVideoMirroringSupported else { return }
+    connection.automaticallyAdjustsVideoMirroring = false
+    connection.isVideoMirrored = isMirrored
+  }
+
+  private func configurePhotoOutput(for device: AVCaptureDevice) {
+    if #available(iOS 16.0, *) {
+      if let maxDimensions = device.activeFormat.supportedMaxPhotoDimensions.last {
+        photoOutput.maxPhotoDimensions = maxDimensions
+      }
+    } else {
+      photoOutput.isHighResolutionCaptureEnabled = true
+    }
+  }
+
+  private func configureCameraDevice(_ device: AVCaptureDevice) -> Bool {
+    do {
+      try device.lockForConfiguration()
+      if device.isFocusModeSupported(.continuousAutoFocus),
+        device.isFocusPointOfInterestSupported
+      {
+        device.focusMode = .continuousAutoFocus
+        device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+      }
+      if device.isExposureModeSupported(.continuousAutoExposure) {
+        device.exposureMode = .continuousAutoExposure
+      }
+      if #available(iOS 18.0, *), device.position == .back {
+        device.videoZoomFactor = min(
+          max(1 / device.displayVideoZoomFactorMultiplier, device.minAvailableVideoZoomFactor),
+          device.maxAvailableVideoZoomFactor
+        )
+      }
+      device.unlockForConfiguration()
+      return true
+    } catch {
+      YOLOLog.error("Camera configuration failed: \(error.localizedDescription)")
+      return false
+    }
   }
 }
 
