@@ -76,11 +76,20 @@ public final class Classifier: BasePredictor, @unchecked Sendable {
   private func softmaxProbs(from multiArray: MLMultiArray) -> Probs {
     let count = multiArray.count
     var logits = [Float](repeating: 0, count: count)
-    for i in 0..<count { logits[i] = multiArray[i].floatValue }
+    if multiArray.dataType == .float32, multiArray.strides.last?.intValue == 1 {
+      let src = multiArray.dataPointer.assumingMemoryBound(to: Float.self)
+      logits.withUnsafeMutableBufferPointer { $0.baseAddress!.update(from: src, count: count) }
+    } else {
+      for i in 0..<count { logits[i] = multiArray[i].floatValue }
+    }
 
     var output = [Float](repeating: 0, count: count)
+    var maxLogit: Float = 0
+    vDSP_maxv(logits, 1, &maxLogit, vDSP_Length(count))
+    var negMax = -maxLogit
+    vDSP_vsadd(logits, 1, &negMax, &output, 1, vDSP_Length(count))
     var n = Int32(count)
-    vvexpf(&output, logits, &n)
+    vvexpf(&output, output, &n)
     var sum: Float = 0
     vDSP_sve(output, 1, &sum, vDSP_Length(count))
     if sum > 0 {
