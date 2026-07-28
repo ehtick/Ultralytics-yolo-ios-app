@@ -117,21 +117,32 @@ public final class ObjectDetector: BasePredictor, @unchecked Sendable {
   func processRawResults(_ prediction: MLMultiArray) -> [Box] {
     let shape = prediction.shape.map { $0.intValue }
     let strides = prediction.strides.map { $0.intValue }
-    let pointer = prediction.dataPointer.assumingMemoryBound(to: Float.self)
     let confThreshold = Float(confidenceThreshold)
 
     // Detect format: end2end [1, max_det, 6] vs traditional [1, 4+nc, num_anchors]
     guard shape.count == 3 else { return [] }
     let isEnd2End = shape[2] < shape[1]
 
-    if isEnd2End {
-      return processEnd2EndResults(
-        pointer: pointer, shape: shape, strides: strides,
-        confThreshold: confThreshold)
-    } else {
-      return processTraditionalResults(
-        pointer: pointer, shape: shape, strides: strides,
-        confThreshold: confThreshold)
+    func decode(_ pointer: UnsafePointer<Float>, strides: [Int]) -> [Box] {
+      if isEnd2End {
+        return processEnd2EndResults(
+          pointer: pointer, shape: shape, strides: strides,
+          confThreshold: confThreshold)
+      } else {
+        return processTraditionalResults(
+          pointer: pointer, shape: shape, strides: strides,
+          confThreshold: confThreshold)
+      }
+    }
+
+    if prediction.dataType == .float32 {
+      return decode(
+        prediction.dataPointer.assumingMemoryBound(to: Float.self), strides: strides)
+    }
+
+    let values = (0..<prediction.count).map { prediction[$0].floatValue }
+    return values.withUnsafeBufferPointer {
+      decode($0.baseAddress!, strides: [shape[1] * shape[2], shape[2], 1])
     }
   }
 
@@ -144,7 +155,7 @@ public final class ObjectDetector: BasePredictor, @unchecked Sendable {
   ///   - confThreshold: Minimum confidence to include a detection.
   /// - Returns: An array of detected boxes.
   private func processEnd2EndResults(
-    pointer: UnsafeMutablePointer<Float>, shape: [Int], strides: [Int],
+    pointer: UnsafePointer<Float>, shape: [Int], strides: [Int],
     confThreshold: Float
   ) -> [Box] {
     let numDetections = shape[1]
@@ -185,7 +196,7 @@ public final class ObjectDetector: BasePredictor, @unchecked Sendable {
   ///   - confThreshold: Minimum confidence to include a detection.
   /// - Returns: An array of detected boxes after non-maximum suppression.
   private func processTraditionalResults(
-    pointer: UnsafeMutablePointer<Float>, shape: [Int], strides: [Int],
+    pointer: UnsafePointer<Float>, shape: [Int], strides: [Int],
     confThreshold: Float
   ) -> [Box] {
     let numFeatures = shape[1]
